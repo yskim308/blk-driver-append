@@ -1,0 +1,21 @@
+# Core kernel object binaries (the final modules)
+*.ko
+
+# Object files and temporary build artifacts
+*.o
+*.mod
+*.mod.c
+*.mod.o
+*.cmd
+*.bpf.o
+
+# Kbuild tracking files
+modules.order
+Module.symvers
+
+# Temporary text logs or dry-run logs
+*.txt
+*.log
+
+# OS-specific clutter (since you are on a Mac)
+.DS_Store
