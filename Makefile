@@ -1,5 +1,5 @@
 ifneq ($(KERNELRELEASE),)
-obj-m := hello.o
+obj-m := ramblk.o
 
 else
 # POINT THIS TO YOUR EXACT KERNEL SOURCE FOLDER
