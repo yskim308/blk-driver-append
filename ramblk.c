@@ -61,9 +61,6 @@ static bool ramblk_rw_bvec(struct ramblk_dev *ramblk, struct bio *bio)
 
 			if (xa_err(__xa_store(&ramblk->l2p_table, cur_log_sec,
 					      sector_ptr, GFP_ATOMIC))) {
-				for (u32 j = 0; j < i; j++)
-					__xa_erase(&ramblk->l2p_table,
-						   logical_sector + j);
 				kunmap_local(kaddr);
 				bio->bi_status = BLK_STS_RESOURCE;
 				xa_unlock(&ramblk->l2p_table);
