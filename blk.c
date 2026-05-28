@@ -117,6 +117,24 @@ out_free_dev:
 	return err;
 }
 
+static void __exit ramblk_exit(void)
+{
+	if (ramblk) {
+		if (ramblk->disk) {
+			del_gendisk(ramblk->disk);
+			put_disk(ramblk->disk);
+		}
+
+		if (ramblk->data) {
+			vfree(ramblk->data);
+		}
+
+		kfree(ramblk);
+	}
+
+	unregister_blkdev(ramblk_major, "ramblk");
+}
+
 module_init(ramblk_init);
 module_exit(ramblk_exit);
 
