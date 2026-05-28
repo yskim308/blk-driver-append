@@ -60,7 +60,6 @@ static const struct block_device_operations ramblk_fops = {
 
 static int __init ramblk_init(void)
 {
-	struct gendisk *disk;
 	struct queue_limits lim = {
 		.logical_block_size = 512,
 		.physical_block_size = 512,
@@ -87,20 +86,20 @@ static int __init ramblk_init(void)
 
 	ramblk->disk = blk_alloc_disk(&lim, NUMA_NO_NODE);
 	if (IS_ERR(ramblk->disk)) {
-		err = PTR_ERR(disk);
+		err = PTR_ERR(ramblk->disk);
 		goto out_free_vmalloc;
 	}
 
 	ramblk->disk->major = ramblk_major;
 	ramblk->disk->first_minor = 0;
-	ramblk->disk->minors = 0;
+	ramblk->disk->minors = 1;
 	ramblk->disk->fops = &ramblk_fops;
 	ramblk->disk->private_data = ramblk;
-	strscpy(disk->disk_name, "ramblk0", DISK_NAME_LEN);
+	strscpy(ramblk->disk->disk_name, "ramblk0", DISK_NAME_LEN);
 
 	set_capacity(ramblk->disk, 32768);
 
-	err = add_disk(disk);
+	err = add_disk(ramblk->disk);
 	if (err) {
 		goto out_cleanup_disk;
 	}
