@@ -72,8 +72,6 @@ static bool ramblk_rw_bvec(struct ramblk_dev *ramblk, struct bio *bio)
 		xa_unlock(&ramblk->l2p_table);
 
 	} else {
-		rcu_read_lock();
-
 		for (u32 i = 0; i < num_sectors; i++) {
 			sector_t cur_log_sec = logical_sector + i;
 			u8 *buffer_offset = (u8 *)kaddr + (i << SECTOR_SHIFT);
@@ -87,8 +85,6 @@ static bool ramblk_rw_bvec(struct ramblk_dev *ramblk, struct bio *bio)
 				memset(buffer_offset, 0, 512);
 			}
 		}
-
-		rcu_read_unlock();
 	}
 
 	kunmap_local(kaddr);
