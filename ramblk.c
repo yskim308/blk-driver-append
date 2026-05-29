@@ -10,13 +10,22 @@
 #include <linux/vmalloc.h>
 #include <linux/bio.h>
 #include <linux/xarray.h>
-#include <linux/rcupdate.h> /* Required for rcu_read_lock */
+#include <linux/spinlock.h>
+#include <linux/list.h>
+
+struct stale_block {
+	u32 physical_sector;
+	struct list_head list;
+};
 
 struct ramblk_dev {
 	u8 *data;
+	struct stale_block *stale_pool;
 	struct gendisk *disk;
 	struct xarray l2p_table;
 	u32 next_free_sector;
+	struct list_head stale_list;
+	spinlock_t lock;
 };
 
 const int TOTAL_BYTES = 16 * 1024 * 1024;
@@ -25,71 +34,124 @@ const u32 MAX_SECTORS = (16 * 1024 * 1024) >> 9;
 static struct ramblk_dev *ramblk;
 static int ramblk_major;
 
+static int alloc_physical_sector(struct ramblk_dev *ramblk,
+				 u32 *physical_sector)
+{
+	struct stale_block *blk;
+	lockdep_assert_held(&ramblk->lock);
+
+	if (!list_empty(&ramblk->stale_list)) {
+		blk = list_first_entry(&ramblk->stale_list, struct stale_block,
+				       list);
+
+		list_del_init(&blk->list);
+		*physical_sector = blk->physical_sector;
+		return 0;
+	}
+
+	if (ramblk->next_free_sector >= MAX_SECTORS)
+		return -ENOSPC;
+
+	*physical_sector = ramblk->next_free_sector++;
+
+	return 0;
+}
+
+static void add_stale_sector(struct ramblk_dev *ramblk, u32 physical_sector)
+{
+	lockdep_assert_held(&ramblk->lock);
+	list_add_tail(&ramblk->stale_pool[physical_sector].list,
+		      &ramblk->stale_list);
+}
+
 static bool ramblk_rw_bvec(struct ramblk_dev *ramblk, struct bio *bio)
 {
 	struct bio_vec bv = bio_iter_iovec(bio, bio->bi_iter);
-	sector_t logical_sector = bio->bi_iter.bi_sector;
-	u32 num_sectors = bv.bv_len >> SECTOR_SHIFT;
 
+	sector_t logical_sector = bio->bi_iter.bi_sector;
+
+	u32 num_sectors;
 	void *kaddr;
-	u8 *target_memory = NULL;
+
+	if (bv.bv_len & (SECTOR_SIZE - 1)) {
+		bio->bi_status = BLK_STS_IOERR;
+		return false;
+	}
+
+	num_sectors = bv.bv_len >> SECTOR_SHIFT;
 
 	kaddr = bvec_kmap_local(&bv);
 
 	if (bio_data_dir(bio) == WRITE) {
-		u32 physical_sector;
-
-		xa_lock(&ramblk->l2p_table);
-
-		if (ramblk->next_free_sector + num_sectors > MAX_SECTORS) {
-			kunmap_local(kaddr);
-			pr_err("ramblk: Out of physical space (No GC implemented)\n");
-			bio->bi_status = BLK_STS_NOSPC;
-			xa_unlock(&ramblk->l2p_table);
-			return false;
-		}
-
-		physical_sector = ramblk->next_free_sector;
-
-		target_memory =
-			ramblk->data + (physical_sector << SECTOR_SHIFT);
-		memcpy(target_memory, kaddr, bv.bv_len);
-
+		spin_lock(&ramblk->lock);
 		for (u32 i = 0; i < num_sectors; i++) {
-			u8 *sector_ptr = target_memory + (i << SECTOR_SHIFT);
 			sector_t cur_log_sec = logical_sector + i;
 
+			u32 new_phys;
+			void *old_entry;
+
+			u8 *src;
+			u8 *dst;
+
+			if (alloc_physical_sector(ramblk, &new_phys)) {
+				spin_unlock(&ramblk->lock);
+
+				kunmap_local(kaddr);
+				pr_err("ramblk: out of space\n");
+				bio->bi_status = BLK_STS_NOSPC;
+
+				return false;
+			}
+
+			old_entry = xa_load(&ramblk->l2p_table, cur_log_sec);
+
+			if (old_entry) {
+				u32 old_phys = xa_to_value(old_entry);
+
+				add_stale_sector(ramblk, old_phys);
+			}
+
+			src = (u8 *)kaddr + (i << SECTOR_SHIFT);
+			dst = ramblk->data + (new_phys << SECTOR_SHIFT);
+
+			memcpy(dst, src, SECTOR_SIZE);
+
 			if (xa_err(__xa_store(&ramblk->l2p_table, cur_log_sec,
-					      sector_ptr, GFP_ATOMIC))) {
+					      xa_mk_value(new_phys),
+					      GFP_ATOMIC))) {
+				add_stale_sector(ramblk, new_phys);
+				spin_unlock(&ramblk->lock);
 				kunmap_local(kaddr);
 				bio->bi_status = BLK_STS_RESOURCE;
-				xa_unlock(&ramblk->l2p_table);
+
 				return false;
 			}
 		}
-
-		ramblk->next_free_sector += num_sectors;
-		xa_unlock(&ramblk->l2p_table);
-
+		spin_unlock(&ramblk->lock);
 	} else {
+		spin_lock(&ramblk->lock);
+
 		for (u32 i = 0; i < num_sectors; i++) {
 			sector_t cur_log_sec = logical_sector + i;
-			u8 *buffer_offset = (u8 *)kaddr + (i << SECTOR_SHIFT);
+			u8 *dst = (u8 *)kaddr + (i << SECTOR_SHIFT);
+			void *entry;
 
-			target_memory =
-				xa_load(&ramblk->l2p_table, cur_log_sec);
+			entry = xa_load(&ramblk->l2p_table, cur_log_sec);
 
-			if (target_memory) {
-				memcpy(buffer_offset, target_memory, 512);
+			if (entry) {
+				u32 phys = xa_to_value(entry);
+				u8 *src = ramblk->data + (phys << SECTOR_SHIFT);
+				memcpy(dst, src, SECTOR_SIZE);
 			} else {
-				memset(buffer_offset, 0, 512);
+				memset(dst, 0, SECTOR_SIZE);
 			}
 		}
+
+		spin_unlock(&ramblk->lock);
 	}
 
 	kunmap_local(kaddr);
 	bio_advance_iter_single(bio, &bio->bi_iter, bv.bv_len);
-
 	return true;
 }
 
@@ -119,12 +181,12 @@ static int __init ramblk_init(void)
 		.physical_block_size = 512,
 		.features = BLK_FEAT_SYNCHRONOUS,
 	};
+
 	int err;
 
 	ramblk_major = register_blkdev(0, "ramblk");
-	if (ramblk_major < 0) {
+	if (ramblk_major < 0)
 		return ramblk_major;
-	}
 
 	ramblk = kzalloc(sizeof(*ramblk), GFP_KERNEL);
 	if (!ramblk) {
@@ -138,10 +200,28 @@ static int __init ramblk_init(void)
 		goto out_free_dev;
 	}
 
+	ramblk->stale_pool =
+		vmalloc(array_size(MAX_SECTORS, sizeof(struct stale_block)));
+	if (!ramblk->stale_pool) {
+		err = -ENOMEM;
+		goto out_free_data;
+	}
+
+	for (u32 i = 0; i < MAX_SECTORS; i++) {
+		ramblk->stale_pool[i].physical_sector = i;
+		INIT_LIST_HEAD(&ramblk->stale_pool[i].list);
+	}
+
 	xa_init(&ramblk->l2p_table);
+
 	ramblk->next_free_sector = 0;
 
+	INIT_LIST_HEAD(&ramblk->stale_list);
+
+	spin_lock_init(&ramblk->lock);
+
 	ramblk->disk = blk_alloc_disk(&lim, NUMA_NO_NODE);
+
 	if (IS_ERR(ramblk->disk)) {
 		err = PTR_ERR(ramblk->disk);
 		goto out_destroy_xa;
@@ -157,17 +237,19 @@ static int __init ramblk_init(void)
 	set_capacity(ramblk->disk, MAX_SECTORS);
 
 	err = add_disk(ramblk->disk);
-	if (err) {
+	if (err)
 		goto out_cleanup_disk;
-	}
 
-	pr_info("ramblk: append-only module loaded (RCU protected)\n");
+	pr_info("ramblk: loaded\n");
+
 	return 0;
 
 out_cleanup_disk:
 	put_disk(ramblk->disk);
 out_destroy_xa:
 	xa_destroy(&ramblk->l2p_table);
+	vfree(ramblk->stale_pool);
+out_free_data:
 	vfree(ramblk->data);
 out_free_dev:
 	kfree(ramblk);
@@ -177,26 +259,30 @@ out_free_dev:
 
 static void __exit ramblk_exit(void)
 {
-	if (ramblk) {
-		if (ramblk->disk) {
-			del_gendisk(ramblk->disk);
-			put_disk(ramblk->disk);
-		}
+	if (!ramblk)
+		return;
 
-		xa_destroy(&ramblk->l2p_table);
-
-		if (ramblk->data) {
-			vfree(ramblk->data);
-		}
-
-		kfree(ramblk);
+	if (ramblk->disk) {
+		del_gendisk(ramblk->disk);
+		put_disk(ramblk->disk);
 	}
 
+	xa_destroy(&ramblk->l2p_table);
+
+	vfree(ramblk->stale_pool);
+
+	if (ramblk->data)
+		vfree(ramblk->data);
+
+	kfree(ramblk);
+
 	unregister_blkdev(ramblk_major, "ramblk");
-	pr_info("ramblk: module unloaded\n");
+
+	pr_info("ramblk: unloaded\n");
 }
 
 module_init(ramblk_init);
 module_exit(ramblk_exit);
 
 MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Append-only RAM block device with stale block reuse");
