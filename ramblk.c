@@ -12,6 +12,7 @@
 #include <linux/xarray.h>
 #include <linux/spinlock.h>
 #include <linux/list.h>
+#include <linux/fs.h>
 
 struct stale_block {
 	u32 physical_sector;
@@ -30,6 +31,8 @@ struct ramblk_dev {
 
 const int TOTAL_BYTES = 16 * 1024 * 1024;
 const u32 MAX_SECTORS = (16 * 1024 * 1024) >> 9;
+
+#define RAMBLK_SAVE_PATH "/var/lib/ramblk.bin"
 
 static struct ramblk_dev *ramblk;
 static int ramblk_major;
@@ -116,9 +119,9 @@ static bool ramblk_rw_bvec(struct ramblk_dev *ramblk, struct bio *bio)
 
 			memcpy(dst, src, SECTOR_SIZE);
 
-			if (xa_err(__xa_store(&ramblk->l2p_table, cur_log_sec,
-					      xa_mk_value(new_phys),
-					      GFP_ATOMIC))) {
+			if (xa_err(xa_store(&ramblk->l2p_table, cur_log_sec,
+					    xa_mk_value(new_phys),
+					    GFP_ATOMIC))) {
 				add_stale_sector(ramblk, new_phys);
 				spin_unlock(&ramblk->lock);
 				kunmap_local(kaddr);
@@ -174,6 +177,56 @@ static const struct block_device_operations ramblk_fops = {
 	.submit_bio = ramblk_submit_bio,
 };
 
+static void ramblk_save(struct ramblk_dev *ramblk)
+{
+	struct file *f;
+	loff_t pos = 0;
+	u32 l2p_entry;
+
+	f = filp_open(RAMBLK_SAVE_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (IS_ERR(f))
+		return;
+
+	kernel_write(f, &ramblk->next_free_sector,
+		     sizeof(ramblk->next_free_sector), &pos);
+
+	for (u32 i = 0; i < MAX_SECTORS; i++) {
+		void *entry = xa_load(&ramblk->l2p_table, i);
+
+		l2p_entry = entry ? xa_to_value(entry) : U32_MAX;
+		kernel_write(f, &l2p_entry, sizeof(l2p_entry), &pos);
+	}
+
+	kernel_write(f, ramblk->data, TOTAL_BYTES, &pos);
+
+	filp_close(f, NULL);
+}
+
+static void ramblk_load(struct ramblk_dev *ramblk)
+{
+	struct file *f;
+	loff_t pos = 0;
+	u32 l2p_entry;
+
+	f = filp_open(RAMBLK_SAVE_PATH, O_RDONLY, 0);
+	if (IS_ERR(f))
+		return;
+
+	kernel_read(f, &ramblk->next_free_sector,
+		    sizeof(ramblk->next_free_sector), &pos);
+
+	for (u32 i = 0; i < MAX_SECTORS; i++) {
+		kernel_read(f, &l2p_entry, sizeof(l2p_entry), &pos);
+		if (l2p_entry != U32_MAX)
+			xa_store(&ramblk->l2p_table, i, xa_mk_value(l2p_entry),
+				 GFP_KERNEL);
+	}
+
+	kernel_read(f, ramblk->data, TOTAL_BYTES, &pos);
+
+	filp_close(f, NULL);
+}
+
 static int __init ramblk_init(void)
 {
 	struct queue_limits lim = {
@@ -219,6 +272,8 @@ static int __init ramblk_init(void)
 	INIT_LIST_HEAD(&ramblk->stale_list);
 
 	spin_lock_init(&ramblk->lock);
+
+	ramblk_load(ramblk);
 
 	ramblk->disk = blk_alloc_disk(&lim, NUMA_NO_NODE);
 
@@ -266,6 +321,8 @@ static void __exit ramblk_exit(void)
 		del_gendisk(ramblk->disk);
 		put_disk(ramblk->disk);
 	}
+
+	ramblk_save(ramblk);
 
 	xa_destroy(&ramblk->l2p_table);
 
