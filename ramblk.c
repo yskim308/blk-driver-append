@@ -13,6 +13,7 @@
 #include <linux/spinlock.h>
 #include <linux/list.h>
 #include <linux/fs.h>
+#include <linux/file.h>
 
 struct stale_block {
 	u32 physical_sector;
@@ -27,6 +28,7 @@ struct ramblk_dev {
 	u32 next_free_sector;
 	struct list_head stale_list;
 	spinlock_t lock;
+	struct file *backing_file; /* persistent backing store */
 };
 
 const int TOTAL_BYTES = 16 * 1024 * 1024;
@@ -37,6 +39,7 @@ const u32 MAX_SECTORS = (16 * 1024 * 1024) >> 9;
 static struct ramblk_dev *ramblk;
 static int ramblk_major;
 
+/* ---- allocation and stale sector helpers (unchanged) ---- */
 static int alloc_physical_sector(struct ramblk_dev *ramblk,
 				 u32 *physical_sector)
 {
@@ -46,7 +49,6 @@ static int alloc_physical_sector(struct ramblk_dev *ramblk,
 	if (!list_empty(&ramblk->stale_list)) {
 		blk = list_first_entry(&ramblk->stale_list, struct stale_block,
 				       list);
-
 		list_del_init(&blk->list);
 		*physical_sector = blk->physical_sector;
 		return 0;
@@ -70,9 +72,7 @@ static void add_stale_sector(struct ramblk_dev *ramblk, u32 physical_sector)
 static bool ramblk_rw_bvec(struct ramblk_dev *ramblk, struct bio *bio)
 {
 	struct bio_vec bv = bio_iter_iovec(bio, bio->bi_iter);
-
 	sector_t logical_sector = bio->bi_iter.bi_sector;
-
 	u32 num_sectors;
 	void *kaddr;
 
@@ -82,41 +82,32 @@ static bool ramblk_rw_bvec(struct ramblk_dev *ramblk, struct bio *bio)
 	}
 
 	num_sectors = bv.bv_len >> SECTOR_SHIFT;
-
 	kaddr = bvec_kmap_local(&bv);
 
 	if (bio_data_dir(bio) == WRITE) {
 		spin_lock(&ramblk->lock);
 		for (u32 i = 0; i < num_sectors; i++) {
 			sector_t cur_log_sec = logical_sector + i;
-
 			u32 new_phys;
 			void *old_entry;
-
-			u8 *src;
-			u8 *dst;
+			u8 *src, *dst;
 
 			if (alloc_physical_sector(ramblk, &new_phys)) {
 				spin_unlock(&ramblk->lock);
-
 				kunmap_local(kaddr);
 				pr_err("ramblk: out of space\n");
 				bio->bi_status = BLK_STS_NOSPC;
-
 				return false;
 			}
 
 			old_entry = xa_load(&ramblk->l2p_table, cur_log_sec);
-
 			if (old_entry) {
 				u32 old_phys = xa_to_value(old_entry);
-
 				add_stale_sector(ramblk, old_phys);
 			}
 
 			src = (u8 *)kaddr + (i << SECTOR_SHIFT);
 			dst = ramblk->data + (new_phys << SECTOR_SHIFT);
-
 			memcpy(dst, src, SECTOR_SIZE);
 
 			if (xa_err(xa_store(&ramblk->l2p_table, cur_log_sec,
@@ -126,20 +117,16 @@ static bool ramblk_rw_bvec(struct ramblk_dev *ramblk, struct bio *bio)
 				spin_unlock(&ramblk->lock);
 				kunmap_local(kaddr);
 				bio->bi_status = BLK_STS_RESOURCE;
-
 				return false;
 			}
 		}
 		spin_unlock(&ramblk->lock);
 	} else {
 		spin_lock(&ramblk->lock);
-
 		for (u32 i = 0; i < num_sectors; i++) {
 			sector_t cur_log_sec = logical_sector + i;
 			u8 *dst = (u8 *)kaddr + (i << SECTOR_SHIFT);
-			void *entry;
-
-			entry = xa_load(&ramblk->l2p_table, cur_log_sec);
+			void *entry = xa_load(&ramblk->l2p_table, cur_log_sec);
 
 			if (entry) {
 				u32 phys = xa_to_value(entry);
@@ -149,7 +136,6 @@ static bool ramblk_rw_bvec(struct ramblk_dev *ramblk, struct bio *bio)
 				memset(dst, 0, SECTOR_SIZE);
 			}
 		}
-
 		spin_unlock(&ramblk->lock);
 	}
 
@@ -179,37 +165,41 @@ static const struct block_device_operations ramblk_fops = {
 
 static void ramblk_save(struct ramblk_dev *ramblk)
 {
-	struct file *f;
 	loff_t pos = 0;
 	u32 l2p_entry;
+	struct file *f = ramblk->backing_file;
 
-	f = filp_open(RAMBLK_SAVE_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-	if (IS_ERR(f))
+	if (!f)
 		return;
+
+	pos = 0;
 
 	kernel_write(f, &ramblk->next_free_sector,
 		     sizeof(ramblk->next_free_sector), &pos);
 
 	for (u32 i = 0; i < MAX_SECTORS; i++) {
 		void *entry = xa_load(&ramblk->l2p_table, i);
-
 		l2p_entry = entry ? xa_to_value(entry) : U32_MAX;
 		kernel_write(f, &l2p_entry, sizeof(l2p_entry), &pos);
 	}
 
 	kernel_write(f, ramblk->data, TOTAL_BYTES, &pos);
 
-	filp_close(f, NULL);
+	vfs_truncate(&f->f_path, pos);
+
+	vfs_fsync(f, 0);
 }
 
 static void ramblk_load(struct ramblk_dev *ramblk)
 {
-	struct file *f;
 	loff_t pos = 0;
 	u32 l2p_entry;
+	struct file *f = ramblk->backing_file;
 
-	f = filp_open(RAMBLK_SAVE_PATH, O_RDONLY, 0);
-	if (IS_ERR(f))
+	if (!f)
+		return;
+
+	if (i_size_read(file_inode(f)) == 0)
 		return;
 
 	kernel_read(f, &ramblk->next_free_sector,
@@ -224,7 +214,21 @@ static void ramblk_load(struct ramblk_dev *ramblk)
 
 	kernel_read(f, ramblk->data, TOTAL_BYTES, &pos);
 
-	filp_close(f, NULL);
+	for (u32 p = 0; p < ramblk->next_free_sector; p++) {
+		bool used = false;
+		unsigned long idx;
+		void *entry;
+
+		xa_for_each(&ramblk->l2p_table, idx, entry) {
+			if (xa_to_value(entry) == p) {
+				used = true;
+				break;
+			}
+		}
+		if (!used)
+			list_add_tail(&ramblk->stale_pool[p].list,
+				      &ramblk->stale_list);
+	}
 }
 
 static int __init ramblk_init(void)
@@ -234,7 +238,6 @@ static int __init ramblk_init(void)
 		.physical_block_size = 512,
 		.features = BLK_FEAT_SYNCHRONOUS,
 	};
-
 	int err;
 
 	ramblk_major = register_blkdev(0, "ramblk");
@@ -266,20 +269,26 @@ static int __init ramblk_init(void)
 	}
 
 	xa_init(&ramblk->l2p_table);
-
 	ramblk->next_free_sector = 0;
-
 	INIT_LIST_HEAD(&ramblk->stale_list);
-
 	spin_lock_init(&ramblk->lock);
+
+	ramblk->backing_file =
+		filp_open(RAMBLK_SAVE_PATH, O_RDWR | O_CREAT, 0600);
+	if (IS_ERR(ramblk->backing_file)) {
+		pr_err("ramblk: failed to open backing file %s\n",
+		       RAMBLK_SAVE_PATH);
+		err = PTR_ERR(ramblk->backing_file);
+		ramblk->backing_file = NULL;
+		goto out_destroy_xa;
+	}
 
 	ramblk_load(ramblk);
 
 	ramblk->disk = blk_alloc_disk(&lim, NUMA_NO_NODE);
-
 	if (IS_ERR(ramblk->disk)) {
 		err = PTR_ERR(ramblk->disk);
-		goto out_destroy_xa;
+		goto out_close_file;
 	}
 
 	ramblk->disk->major = ramblk_major;
@@ -296,11 +305,13 @@ static int __init ramblk_init(void)
 		goto out_cleanup_disk;
 
 	pr_info("ramblk: loaded\n");
-
 	return 0;
 
 out_cleanup_disk:
 	put_disk(ramblk->disk);
+out_close_file:
+	if (ramblk->backing_file)
+		filp_close(ramblk->backing_file, NULL);
 out_destroy_xa:
 	xa_destroy(&ramblk->l2p_table);
 	vfree(ramblk->stale_pool);
@@ -324,13 +335,13 @@ static void __exit ramblk_exit(void)
 
 	ramblk_save(ramblk);
 
+	if (ramblk->backing_file)
+		filp_close(ramblk->backing_file, NULL);
+
 	xa_destroy(&ramblk->l2p_table);
-
 	vfree(ramblk->stale_pool);
-
 	if (ramblk->data)
 		vfree(ramblk->data);
-
 	kfree(ramblk);
 
 	unregister_blkdev(ramblk_major, "ramblk");
@@ -342,4 +353,5 @@ module_init(ramblk_init);
 module_exit(ramblk_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Append-only RAM block device with stale block reuse");
+MODULE_DESCRIPTION(
+	"Append‑only RAM block device with persistent stale block reuse");
