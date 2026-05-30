@@ -28,7 +28,7 @@ struct ramblk_dev {
 	u32 next_free_sector;
 	struct list_head stale_list;
 	spinlock_t lock;
-	struct file *backing_file; /* persistent backing store */
+	struct file *backing_file;
 };
 
 const int TOTAL_BYTES = 16 * 1024 * 1024;
@@ -39,7 +39,6 @@ const u32 MAX_SECTORS = (16 * 1024 * 1024) >> 9;
 static struct ramblk_dev *ramblk;
 static int ramblk_major;
 
-/* ---- allocation and stale sector helpers (unchanged) ---- */
 static int alloc_physical_sector(struct ramblk_dev *ramblk,
 				 u32 *physical_sector)
 {
