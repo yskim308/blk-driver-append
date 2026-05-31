@@ -43,22 +43,24 @@ static int alloc_physical_sector(struct ramblk_dev *ramblk,
 				 u32 *physical_sector)
 {
 	struct stale_block *blk;
+
 	lockdep_assert_held(&ramblk->lock);
+
+	if (ramblk->next_free_sector < MAX_SECTORS) {
+		*physical_sector = ramblk->next_free_sector++;
+		return 0;
+	}
 
 	if (!list_empty(&ramblk->stale_list)) {
 		blk = list_first_entry(&ramblk->stale_list, struct stale_block,
 				       list);
+
 		list_del_init(&blk->list);
 		*physical_sector = blk->physical_sector;
 		return 0;
 	}
 
-	if (ramblk->next_free_sector >= MAX_SECTORS)
-		return -ENOSPC;
-
-	*physical_sector = ramblk->next_free_sector++;
-
-	return 0;
+	return -ENOSPC;
 }
 
 static void add_stale_sector(struct ramblk_dev *ramblk, u32 physical_sector)
@@ -230,6 +232,23 @@ static void ramblk_load(struct ramblk_dev *ramblk)
 	}
 }
 
+static void display_list(struct ramblk_dev *ramblk)
+{
+	unsigned long logical_sector;
+	void *entry;
+
+	spin_lock(&ramblk->lock);
+
+	pr_info("ramblk: L2P mapping table\n");
+
+	xa_for_each(&ramblk->l2p_table, logical_sector, entry) {
+		pr_info("LBA %lu -> PBA %u\n", logical_sector,
+			xa_to_value(entry));
+	}
+
+	spin_unlock(&ramblk->lock);
+}
+
 static int __init ramblk_init(void)
 {
 	struct queue_limits lim = {
@@ -327,6 +346,7 @@ static void __exit ramblk_exit(void)
 	if (!ramblk)
 		return;
 
+	// display_list(ramblk);
 	if (ramblk->disk) {
 		del_gendisk(ramblk->disk);
 		put_disk(ramblk->disk);
