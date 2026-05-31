@@ -31,8 +31,11 @@ struct ramblk_dev {
 	struct file *backing_file;
 };
 
-const int TOTAL_BYTES = 16 * 1024 * 1024;
-const u32 MAX_SECTORS = (16 * 1024 * 1024) >> 9;
+const int PHYSICAL_BYTES = 17 * 1024 * 1024;
+const u32 PHYSICAL_SECTORS = (17 * 1024 * 1024) >> 9;
+
+const int LOGICAL_BYTES = 16 * 1024 * 1024;
+const u32 LOGICAL_SECTORS = (16 * 1024 * 1024) >> 9;
 
 #define RAMBLK_SAVE_PATH "/var/lib/ramblk.bin"
 
@@ -46,7 +49,7 @@ static int alloc_physical_sector(struct ramblk_dev *ramblk,
 
 	lockdep_assert_held(&ramblk->lock);
 
-	if (ramblk->next_free_sector < MAX_SECTORS) {
+	if (ramblk->next_free_sector < PHYSICAL_SECTORS) {
 		*physical_sector = ramblk->next_free_sector++;
 		return 0;
 	}
@@ -178,13 +181,13 @@ static void ramblk_save(struct ramblk_dev *ramblk)
 	kernel_write(f, &ramblk->next_free_sector,
 		     sizeof(ramblk->next_free_sector), &pos);
 
-	for (u32 i = 0; i < MAX_SECTORS; i++) {
+	for (u32 i = 0; i < LOGICAL_SECTORS; i++) {
 		void *entry = xa_load(&ramblk->l2p_table, i);
 		l2p_entry = entry ? xa_to_value(entry) : U32_MAX;
 		kernel_write(f, &l2p_entry, sizeof(l2p_entry), &pos);
 	}
 
-	kernel_write(f, ramblk->data, TOTAL_BYTES, &pos);
+	kernel_write(f, ramblk->data, PHYSICAL_BYTES, &pos);
 
 	vfs_truncate(&f->f_path, pos);
 
@@ -206,14 +209,14 @@ static void ramblk_load(struct ramblk_dev *ramblk)
 	kernel_read(f, &ramblk->next_free_sector,
 		    sizeof(ramblk->next_free_sector), &pos);
 
-	for (u32 i = 0; i < MAX_SECTORS; i++) {
+	for (u32 i = 0; i < LOGICAL_SECTORS; i++) {
 		kernel_read(f, &l2p_entry, sizeof(l2p_entry), &pos);
 		if (l2p_entry != U32_MAX)
 			xa_store(&ramblk->l2p_table, i, xa_mk_value(l2p_entry),
 				 GFP_KERNEL);
 	}
 
-	kernel_read(f, ramblk->data, TOTAL_BYTES, &pos);
+	kernel_read(f, ramblk->data, PHYSICAL_BYTES, &pos);
 
 	for (u32 p = 0; p < ramblk->next_free_sector; p++) {
 		bool used = false;
@@ -268,20 +271,20 @@ static int __init ramblk_init(void)
 		return -ENOMEM;
 	}
 
-	ramblk->data = vmalloc(TOTAL_BYTES);
+	ramblk->data = vmalloc(PHYSICAL_BYTES);
 	if (!ramblk->data) {
 		err = -ENOMEM;
 		goto out_free_dev;
 	}
 
-	ramblk->stale_pool =
-		vmalloc(array_size(MAX_SECTORS, sizeof(struct stale_block)));
+	ramblk->stale_pool = vmalloc(
+		array_size(PHYSICAL_SECTORS, sizeof(struct stale_block)));
 	if (!ramblk->stale_pool) {
 		err = -ENOMEM;
 		goto out_free_data;
 	}
 
-	for (u32 i = 0; i < MAX_SECTORS; i++) {
+	for (u32 i = 0; i < PHYSICAL_SECTORS; i++) {
 		ramblk->stale_pool[i].physical_sector = i;
 		INIT_LIST_HEAD(&ramblk->stale_pool[i].list);
 	}
@@ -316,7 +319,7 @@ static int __init ramblk_init(void)
 	ramblk->disk->private_data = ramblk;
 	strscpy(ramblk->disk->disk_name, "ramblk0", DISK_NAME_LEN);
 
-	set_capacity(ramblk->disk, MAX_SECTORS);
+	set_capacity(ramblk->disk, LOGICAL_SECTORS);
 
 	err = add_disk(ramblk->disk);
 	if (err)
